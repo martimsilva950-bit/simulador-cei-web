@@ -32,10 +32,15 @@ export default function App() {
 
   useEffect(() => {
     async function loadSession() {
-      if (!supabase) return;
-      const { data } = await supabase.auth.getUser();
-      if (!data.user) return;
-      await loadProfile(data.user.id, data.user.email || '', data.user.user_metadata?.nome);
+      // Proteção contra falha no fetch do Supabase
+      try {
+        if (!supabase) return;
+        const { data } = await supabase.auth.getUser();
+        if (!data.user) return;
+        await loadProfile(data.user.id, data.user.email || '', data.user.user_metadata?.nome);
+      } catch (e) {
+        console.warn("Erro ao carregar sessão Supabase, ignorando...", e);
+      }
     }
 
     loadSession();
@@ -58,42 +63,47 @@ export default function App() {
 
   async function loadProfile(userId: string, email: string, nome?: string) {
     if (!supabase) return null;
-    const { data, error } = await supabase.from('profiles').select('*').eq('id', userId).single();
-    let profileData = data;
+    try {
+      const { data, error } = await supabase.from('profiles').select('*').eq('id', userId).single();
+      let profileData = data;
 
-    if (error || !profileData) {
-      const fallbackProfile = {
-        id: userId,
-        nome: nome || email.split('@')[0] || 'Cliente',
-        email,
-        role: 'cliente',
-      };
+      if (error || !profileData) {
+        const fallbackProfile = {
+          id: userId,
+          nome: nome || email.split('@')[0] || 'Cliente',
+          email,
+          role: 'cliente',
+        };
 
-      const { data: createdProfile, error: createError } = await supabase
-        .from('profiles')
-        .insert(fallbackProfile)
-        .select()
-        .single();
+        const { data: createdProfile, error: createError } = await supabase
+          .from('profiles')
+          .insert(fallbackProfile)
+          .select()
+          .single();
 
-      if (createError || !createdProfile) {
-        setNotice(`Login feito, mas não foi possível carregar o perfil: ${createError?.message || error?.message || 'erro desconhecido'}`);
-        return null;
+        if (createError || !createdProfile) {
+          setNotice(`Login feito, mas não foi possível carregar o perfil: ${createError?.message || error?.message || 'erro desconhecido'}`);
+          return null;
+        }
+
+        profileData = createdProfile;
       }
 
-      profileData = createdProfile;
+      const nextProfile: Profile = {
+        id: profileData.id,
+        nome: profileData.nome || email,
+        email,
+        role: profileData.role,
+      };
+
+      setProfile(nextProfile);
+      setPage('dashboard');
+      window.history.replaceState({}, '', nextProfile.role === 'admin' ? '/admin' : '/cliente');
+      return nextProfile;
+    } catch (e) {
+      setNotice('Erro de ligação com a base de dados.');
+      return null;
     }
-
-    const nextProfile: Profile = {
-      id: profileData.id,
-      nome: profileData.nome || email,
-      email,
-      role: profileData.role,
-    };
-
-    setProfile(nextProfile);
-    setPage('dashboard');
-    window.history.replaceState({}, '', nextProfile.role === 'admin' ? '/admin' : '/cliente');
-    return nextProfile;
   }
 
   async function handleLogin(email: string, password: string) {
@@ -113,22 +123,57 @@ export default function App() {
       return;
     }
 
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error || !data.user) {
-      setNotice(`Não foi possível entrar: ${error?.message || 'confirma o email e a password.'}`);
-      setLoading(false);
-      return;
-    }
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error || !data.user) {
+        setNotice(`Não foi possível entrar: ${error?.message || 'confirma o email e a password.'}`);
+        setLoading(false);
+        return;
+      }
 
-    await loadProfile(data.user.id, data.user.email || email, data.user.user_metadata?.nome);
-    setLoading(false);
+      await loadProfile(data.user.id, data.user.email || email, data.user.user_metadata?.nome);
+    } catch (e) {
+      setNotice('Erro crítico de rede: Ative o Modo Demonstração ou configure as variáveis da Vercel.');
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function handleRegister(nome: string, email: string, password: string) {
     setLoading(true);
     setNotice('');
 
-    if (!isSupabaseConfigured || !supabase) {
+    // Se o Supabase falhar na Vercel, isto evita que a app dê crash e usa os dados locais temporários
+    try {
+      if (!isSupabaseConfigured || !supabase) {
+        throw new Error("Supabase não configurado");
+      }
+
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: { nome },
+        },
+      });
+      
+      if (error || !data.user) {
+        setNotice(`Não foi possível criar a conta: ${error?.message || 'tenta novamente.'}`);
+        setLoading(false);
+        return;
+      }
+
+      if (!data.session) {
+        setNotice('Conta criada. Confirma o email antes de entrar.');
+        setLoading(false);
+        return;
+      }
+
+      await loadProfile(data.user.id, data.user.email || email, nome);
+      navigate('dashboard');
+    } catch (e) {
+      // FALLBACK: Se der erro de URL inválido do Supabase, cria uma conta de demonstração local
+      console.warn("Redirecionando para conta demo devido a erro de configuração do Supabase.");
       const demoProfile: Profile = {
         id: crypto.randomUUID(),
         nome,
@@ -136,37 +181,16 @@ export default function App() {
         role: 'cliente',
       };
       setProfile(demoProfile);
-      setLoading(false);
       navigate('dashboard');
-      return;
-    }
-
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        data: { nome },
-      },
-    });
-    if (error || !data.user) {
-      setNotice(`Não foi possível criar a conta: ${error?.message || 'tenta novamente.'}`);
+    } finally {
       setLoading(false);
-      return;
     }
-
-    if (!data.session) {
-      setNotice('Conta criada. Confirma o email antes de entrar.');
-      setLoading(false);
-      return;
-    }
-
-    await loadProfile(data.user.id, data.user.email || email, nome);
-    setLoading(false);
-    navigate('dashboard');
   }
 
   async function logout() {
-    if (supabase) await supabase.auth.signOut();
+    try {
+      if (supabase) await supabase.auth.signOut();
+    } catch(e) {}
     setProfile(null);
     navigate('home');
   }
@@ -206,7 +230,7 @@ export default function App() {
         </nav>
       </header>
 
-      {!isSupabaseConfigured && (
+      {(!isSupabaseConfigured || !supabase) && (
         <div className="demo-banner">
           <CheckCircle2 size={17} />
           Modo demonstração ativo. Liga o Supabase quando quiseres guardar utilizadores online.
